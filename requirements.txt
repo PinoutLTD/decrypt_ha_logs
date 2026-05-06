@@ -2,3 +2,4 @@ PyYAML==6.0.3
 robonomics-interface==2.0.0
 IPFS-Toolkit==0.6.0rc8
 pynacl==1.6.2
+emtest==0.1.2
