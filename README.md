@@ -6,11 +6,12 @@ to inspect.
 
 ## Configuration
 
-Copy `creds.yaml.example` to `creds.yaml` and fill in the recipient seed and
-sender addresses.
+Copy `creds.yaml.example` to `creds.yaml` and fill in the recipient address and
+sender addresses. The config contains no secrets.
 
 ```yaml
-recipient_seed: "..."
+recipient_address: "4..."
+pass_vault: Report Service
 
 sender_addresses:
   - address: "..."
@@ -21,9 +22,18 @@ sender_addresses:
 reports_per_address: 2
 reports_dir: reports
 clean_reports: true
-ipfs_gateway: https://ipfs.io
+ipfs_gateway: https://gateway.pinata.cloud
 network_wss: wss://polkadot.rpc.robonomics.network/
 ```
+
+### Recipient seed
+
+The seed never lives on disk. It is read at startup with
+[`pass-cli`](https://protonpass.github.io/pass-cli/) from the vault `pass_vault`,
+item titled `Robonomics - <recipient_address>`, field `seed`, and the script
+checks that the seed derives exactly `recipient_address` before doing anything.
+Log in once with `pass-cli login`. When running under a Proton Pass agent token,
+`PROTON_PASS_AGENT_REASON` may be overridden in the environment.
 
 ## Installation
 
@@ -56,6 +66,13 @@ Use another config file:
 ```bash
 .venv/bin/python decrypt_ha_logs.py --creds /path/to/creds.yaml
 ```
+
+The script prints step-by-step progress (datalog reads, download speed, retries,
+decryption). Hide it with `--quiet`.
+
+Reports are pinned on Pinata, so `https://gateway.pinata.cloud` serves fresh CIDs
+reliably; public gateways such as `ipfs.io` first have to find the content in the
+IPFS network and can stall on a cold CID.
 
 By default, `reports_dir` is cleaned before every run. Decrypted reports are
 stored like this:

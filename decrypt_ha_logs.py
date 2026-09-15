@@ -1,9 +1,12 @@
 import argparse
 import json
 import logging
+import os
 import re
 import shutil
+import subprocess
 import sys
+import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,14 +18,22 @@ import requests
 import yaml
 from ipfs_remote.ipfshttpclient2.exceptions import ConnectionError
 from nacl.secret import SecretBox
-from requests.adapters import HTTPAdapter
 from robonomicsinterface import Account, Datalog
-from substrateinterface import Keypair, KeypairType
-from urllib3.util import Retry
+from substrateinterface import Keypair, KeypairType, SubstrateInterface
+from substrateinterface.utils.ss58 import is_valid_ss58_address
 
 LOGGER = logging.getLogger(__name__)
+# Step-by-step status messages; hidden with --quiet.
+PROGRESS = logging.getLogger(__name__ + ".progress")
 
 CREDS_FILE = "creds.yaml"
+DOWNLOAD_ATTEMPTS = 5
+DOWNLOAD_BACKOFF_SECONDS = 3
+DOWNLOAD_TIMEOUT_SECONDS = (10, 60)  # (connect, read between chunks)
+RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+PROGRESS_INTERVAL_SECONDS = 2.0
+DEFAULT_PASS_VAULT = "Report Service"
+PASS_ITEM_PREFIX = "Robonomics - "
 
 
 @dataclass(frozen=True)
@@ -33,7 +44,8 @@ class SenderConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
-    recipient_seed: str
+    recipient_address: str
+    pass_vault: str
     sender_addresses: list[SenderConfig]
     reports_dir: Path
     reports_per_address: int
@@ -42,16 +54,38 @@ class AppConfig:
     clean_reports: bool
 
 
-def setup_logging() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+def setup_logging(quiet: bool) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    if quiet:
+        PROGRESS.setLevel(logging.WARNING)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download and decrypt recent Home Assistant reports from Robonomics datalog."
+        description=(
+            "Download and decrypt recent Home Assistant reports "
+            "from Robonomics datalog."
+        )
     )
     parser.add_argument("--creds", default=CREDS_FILE, help="Path to creds YAML file.")
+    parser.add_argument(
+        "--quiet", action="store_true", help="Hide step-by-step progress messages."
+    )
     return parser.parse_args()
+
+
+def format_size(num_bytes: float) -> str:
+    for unit in ("B", "KB", "MB"):
+        if num_bytes < 1024:
+            return (
+                f"{num_bytes:.0f} {unit}" if unit == "B" else f"{num_bytes:.1f} {unit}"
+            )
+        num_bytes /= 1024
+    return f"{num_bytes:.1f} GB"
 
 
 def require_config_value(creds: dict, key: str):
@@ -101,6 +135,8 @@ def normalize_sender_addresses(creds: dict) -> list[SenderConfig]:
 
         if not address:
             raise ValueError("Sender address cannot be empty.")
+        if not is_valid_ss58_address(address):
+            raise ValueError(f"Sender '{name}' has an invalid SS58 address: {address}")
         result.append(SenderConfig(address=address, name=name or address))
 
     if not result:
@@ -110,17 +146,22 @@ def normalize_sender_addresses(creds: dict) -> list[SenderConfig]:
 
 def load_config(args: argparse.Namespace) -> AppConfig:
     creds_path = Path(args.creds)
-    with open(creds_path, "r", encoding="utf-8") as f:
+    with open(creds_path, encoding="utf-8") as f:
         creds: dict = yaml.load(f, Loader=yaml.SafeLoader) or {}
 
-    recipient_seed = require_config_str(creds, "recipient_seed")
+    if "recipient_seed" in creds:
+        raise ValueError(
+            "recipient_seed is no longer read from creds.yaml: store the seed in "
+            "Proton Pass and set recipient_address instead (see README)."
+        )
 
     reports_per_address = require_config_int(creds, "reports_per_address")
     if reports_per_address < 1:
         raise ValueError("reports_per_address must be greater than 0.")
 
     return AppConfig(
-        recipient_seed=recipient_seed,
+        recipient_address=require_config_str(creds, "recipient_address"),
+        pass_vault=str(creds.get("pass_vault") or DEFAULT_PASS_VAULT).strip(),
         sender_addresses=normalize_sender_addresses(creds),
         reports_dir=Path(require_config_str(creds, "reports_dir")),
         reports_per_address=reports_per_address,
@@ -128,6 +169,41 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         network_wss=require_config_str(creds, "network_wss"),
         clean_reports=require_config_bool(creds, "clean_reports"),
     )
+
+
+def load_recipient_seed(address: str, vault: str) -> str:
+    """Fetch the recipient seed from Proton Pass; it is kept in memory only."""
+    item_title = PASS_ITEM_PREFIX + address
+    env = os.environ.copy()
+    # Required by pass-cli when running under an agent token.
+    env.setdefault("PROTON_PASS_AGENT_REASON", "Decrypt Home Assistant reports")
+    try:
+        result = subprocess.run(
+            [
+                "pass-cli",
+                "item",
+                "view",
+                "--vault-name",
+                vault,
+                "--item-title",
+                item_title,
+                "--field",
+                "seed",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except FileNotFoundError as e:
+        raise ValueError("pass-cli is not installed.") from e
+
+    seed = result.stdout.strip()
+    if result.returncode != 0 or not seed:
+        raise ValueError(
+            f"Cannot read field 'seed' of item '{item_title}' in vault '{vault}'. "
+            "Check `pass-cli login` and that the item exists."
+        )
+    return seed
 
 
 def ipfs_download(cid: str, file_path: Path, gateway: str) -> None:
@@ -140,30 +216,59 @@ def ipfs_download(cid: str, file_path: Path, gateway: str) -> None:
     """
     if gateway:
         url: str = urllib.parse.urljoin(gateway.rstrip("/") + "/", "ipfs/" + cid)
-        retry_num: int = 5
-        try:
-            retry_strategy = Retry(
-                total=retry_num,
-                backoff_factor=3,
-                status_forcelist=[429, 500, 502, 503, 504],
-            )
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            PROGRESS.info("GET %s (attempt %s/%s)", url, attempt, DOWNLOAD_ATTEMPTS)
+            try:
+                stream_to_file(url, file_path)
+                return
+            except requests.RequestException as e:
+                status = e.response.status_code if e.response is not None else None
+                retryable = status is None or status in RETRYABLE_HTTP_STATUSES
+                if not retryable or attempt == DOWNLOAD_ATTEMPTS:
+                    LOGGER.warning("IPFS gateway download failed: %s", e)
+                    break
+                delay = DOWNLOAD_BACKOFF_SECONDS * 2 ** (attempt - 1)
+                PROGRESS.info(
+                    "Attempt %s failed (%s), retrying in %ss", attempt, e, delay
+                )
+                time.sleep(delay)
 
-            adapter = HTTPAdapter(max_retries=retry_strategy)
-            session = requests.Session()
-            session.mount("http://", adapter)
-            session.mount("https://", adapter)
-
-            response = session.get(url, allow_redirects=True, timeout=60)
-            response.raise_for_status()
-
-            with open(file_path, "wb") as f:
-                f.write(response.content)
-            return
-
-        except Exception as e:
-            LOGGER.warning("IPFS gateway download failed: %s", e)
-
+    LOGGER.warning(
+        "Falling back to a local IPFS node for %s; this can take a long time", cid
+    )
     ipfs_api.download(cid, str(file_path))
+
+
+def stream_to_file(url: str, file_path: Path) -> None:
+    started = time.monotonic()
+    with requests.get(
+        url, stream=True, allow_redirects=True, timeout=DOWNLOAD_TIMEOUT_SECONDS
+    ) as response:
+        response.raise_for_status()
+        total = int(response.headers.get("Content-Length") or 0)
+        PROGRESS.info(
+            "Gateway responded after %.1fs, size %s",
+            time.monotonic() - started,
+            format_size(total) if total else "unknown",
+        )
+        received = 0
+        last_report = time.monotonic()
+        with open(file_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                f.write(chunk)
+                received += len(chunk)
+                now = time.monotonic()
+                if now - last_report >= PROGRESS_INTERVAL_SECONDS:
+                    PROGRESS.info(
+                        "  %s%s, %s/s",
+                        format_size(received),
+                        f" of {format_size(total)}" if total else "",
+                        format_size(received / (now - started)),
+                    )
+                    last_report = now
+    PROGRESS.info(
+        "Downloaded %s in %.1fs", format_size(received), time.monotonic() - started
+    )
 
 
 def parse_decrypted(text: str) -> tuple[str, dict | None]:
@@ -316,18 +421,41 @@ def get_datalog_item(
     return record
 
 
+def read_datalog_window_size(network_wss: str) -> int:
+    with SubstrateInterface(url=network_wss) as substrate:
+        return int(substrate.get_constant("Datalog", "WindowSize").value)
+
+
+def ring_buffer_indices(start: int, end: int, window_size: int) -> list[int]:
+    """Datalog slots from oldest to newest.
+
+    The pallet keeps the last `window_size - 1` records per account and reuses
+    slots once full, so `end < start` means the buffer has wrapped around.
+    """
+    count = end - start if start <= end else window_size + end - start
+    return [(start + offset) % window_size for offset in range(count)]
+
+
 def get_recent_datalogs(
-    datalog: Datalog, sender_address: str, count: int
+    datalog: Datalog, sender_address: str, count: int, window_size: int
 ) -> list[tuple[int, int, str]]:
+    PROGRESS.info("Reading datalog index")
     index_info = datalog.get_index(sender_address)
     start = int(index_info["start"])
     end = int(index_info["end"])
-    if end <= start:
-        return []
+    all_indices = ring_buffer_indices(start, end, window_size)
+    PROGRESS.info(
+        "Datalog ring buffer start=%s end=%s holds %s record(s)%s",
+        start,
+        end,
+        len(all_indices),
+        " (wrapped)" if end < start else "",
+    )
 
-    indices = range(max(start, end - count), end)
+    indices = all_indices[-count:]
     result: list[tuple[int, int, str]] = []
     for index in indices:
+        PROGRESS.info("Reading datalog #%s", index)
         record = get_datalog_item(datalog, sender_address, index)
         if record is None:
             LOGGER.warning("Datalog #%s is empty for %s", index, sender_address)
@@ -344,11 +472,16 @@ def decrypt_archive_files(
     sender_address: str,
 ) -> int:
     decrypted_count = 0
-    for entry in sorted(archive_files_path.rglob("*")):
-        if not entry.is_file():
-            continue
-
-        with open(entry, "r", encoding="utf-8") as f:
+    entries = [e for e in sorted(archive_files_path.rglob("*")) if e.is_file()]
+    for position, entry in enumerate(entries, start=1):
+        PROGRESS.info(
+            "Decrypting %s/%s: %s (%s)",
+            position,
+            len(entries),
+            entry.name,
+            format_size(entry.stat().st_size),
+        )
+        with open(entry, encoding="utf-8") as f:
             data = f.read()
 
         try:
@@ -402,19 +535,24 @@ def process_sender(
     datalog: Datalog,
     recipient_account: Account,
     config: AppConfig,
+    window_size: int,
 ) -> None:
     sender_dir = config.reports_dir / safe_path_part(sender.name)
     sender_dir.mkdir(parents=True, exist_ok=True)
 
-    LOGGER.info("Processing sender %s", sender.address)
+    LOGGER.info("Processing sender %s (%s)", sender.name, sender.address)
+    started = time.monotonic()
     records = get_recent_datalogs(
-        datalog, sender.address, config.reports_per_address
+        datalog, sender.address, config.reports_per_address, window_size
     )
     if not records:
         LOGGER.warning("No datalog records found for %s", sender.address)
         return
 
-    for index, timestamp, cid in records:
+    for position, (index, timestamp, cid) in enumerate(records, start=1):
+        PROGRESS.info(
+            "Report %s/%s: datalog #%s, CID %s", position, len(records), index, cid
+        )
         report_dir = sender_dir / f"datalog_{index}_{timestamp}"
         report_dir.mkdir(parents=True, exist_ok=True)
         cid_file = report_dir / "cid.txt"
@@ -442,36 +580,52 @@ def process_sender(
                 sender.address,
                 e,
             )
+    PROGRESS.info("Sender %s done in %.1fs", sender.name, time.monotonic() - started)
 
 
 def main() -> int:
-    setup_logging()
+    args = parse_args()
+    setup_logging(args.quiet)
+    started = time.monotonic()
     try:
-        config = load_config(parse_args())
+        config = load_config(args)
+
+        PROGRESS.info(
+            "Reading recipient seed from Proton Pass (vault '%s')", config.pass_vault
+        )
+        recipient_account = Account(
+            load_recipient_seed(config.recipient_address, config.pass_vault),
+            crypto_type=KeypairType.ED25519,
+            remote_ws=config.network_wss,
+        )
+        if recipient_account.get_address() != config.recipient_address:
+            raise ValueError(
+                "Seed from Proton Pass does not match recipient_address "
+                f"{config.recipient_address}."
+            )
+        PROGRESS.info("Recipient address verified: %s", config.recipient_address)
+        PROGRESS.info("Using Robonomics node %s", config.network_wss)
+        window_size = read_datalog_window_size(config.network_wss)
+        PROGRESS.info("Datalog window size: %s", window_size)
 
         if config.clean_reports:
             clean_reports_dir(config.reports_dir)
         else:
             config.reports_dir.mkdir(parents=True, exist_ok=True)
 
-        recipient_account = Account(
-            config.recipient_seed,
-            crypto_type=KeypairType.ED25519,
-            remote_ws=config.network_wss,
-        )
         datalog = Datalog(
             recipient_account, rws_sub_owner=recipient_account.get_address()
         )
 
         for sender in config.sender_addresses:
             try:
-                process_sender(sender, datalog, recipient_account, config)
+                process_sender(sender, datalog, recipient_account, config, window_size)
             except Exception as e:
                 LOGGER.warning(
                     "Problem during processing sender %s: %s", sender.address, e
                 )
 
-        LOGGER.info("All done")
+        LOGGER.info("All done in %.1fs", time.monotonic() - started)
         return 0
     except Exception as e:
         LOGGER.error("%s", e)

@@ -3,3 +3,5 @@ creds.yaml
 .venv/
 __pycache__/
 reports/
+.ipfs_tk.log
+.claude/
