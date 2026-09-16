@@ -1,4 +1,5 @@
-recipient_seed: ''
+recipient_address: ''
+pass_vault: Report Service
 
 sender_addresses:
   - address: ''
@@ -7,5 +8,5 @@ sender_addresses:
 reports_per_address: 2
 reports_dir: reports
 clean_reports: true
-ipfs_gateway: https://ipfs.io
+ipfs_gateway: https://gateway.pinata.cloud
 network_wss: wss://polkadot.rpc.robonomics.network/
