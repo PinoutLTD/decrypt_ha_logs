@@ -1,4 +1,24 @@
-# decrypt_ha_logs
+# decrypt_ha_logs — archived, superseded by rrs-connector
+
+This was the hand tool for reading a report while the connector was being
+built. [`rrs-connector`](https://github.com/PinoutLTD/rrs-connector) now does
+the same thing and more, so this repository is archived and no longer
+maintained:
+
+```bash
+rrs-connector --command fetch --sender <ss58> --cid <cid> --output ./case
+rrs-connector --command fetch --sender <ss58> --last 2
+```
+
+Like this tool, `fetch` leaves no trace in the service's state: it downloads,
+decrypts, and writes where it is told. Unlike this tool, it shares one
+implementation with the service that files the reports as helpdesk tickets,
+so the report format has a single reader.
+
+The history stays readable here — including the ring buffer fix, which is the
+reason the connector reads active sites correctly.
+
+---
 
 Downloads recent Home Assistant report archives from Robonomics datalog records,
 decrypts them, and stores the decrypted files in a directory tree that is easy
